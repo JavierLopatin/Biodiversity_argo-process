@@ -59,41 +59,42 @@ apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
   name: biodiv-map-inference
+  namespace: easi-workflows-argo
   labels:
     name: biodiv-map-inference
     owner: "jlopatin"          # EDIT-ME if EASI expects a different value
-    team: "EDIT-ME"
+    team: "uai-projects"
 spec:
   entrypoint: main
-  serviceAccountName: EDIT-ME   # e.g. data-pipelines-default — ask EASI admins
+  serviceAccountName: easi-workflows-team-sa-argo   # e.g. data-pipelines-default — ask EASI admins
   parallelism: 3                 # test run: 3 pods max. Raise once verified.
   podGC:
     strategy: OnWorkflowSuccess
   artifactGC:
     strategy: OnWorkflowDeletion
-    serviceAccountName: EDIT-ME  # same as above, usually
+    serviceAccountName: easi-workflows-team-sa-argo  # same as above, usually
 
   arguments:
     parameters:
       - name: base-image
         # Same shared EASI image lemu-national uses. EDIT-ME: confirm it has
         # torch + rasterio for process-chunk, or point this at your own image.
-        value: "444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base:develop.latest"
+        value: "444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest"
       - name: repo-url
-        value: "https://github.com/JavierLopatin/Biodiversity_Chile.git"   # private
+        value: "https://github.com/JavierLopatin/Biodiversity_argo-process.git"   # private
       - name: repo-branch
         value: main   # EDIT-ME if the working branch differs
-      - name: git-secret
-        value: EDIT-ME-biodiversity-chile-git-ro-access
+      #- name: git-secret
+      #  value: EDIT-ME-biodiversity-chile-git-ro-access
       - name: git-image
         value: "registry.k8s.io/git-sync/git-sync:v4.5.0"
       - name: db-config-secret
         # Secret with key `.datacube.conf`, same pattern as lemu's
         # easi-odc-v2-user-db — ask EASI admins for Javier's equivalent.
-        value: EDIT-ME-odc-user-db
+        value: easi-odc-v2-user-db
       - name: s3-dest
         # Same destination the pod's own chile_gw/chile_pod workers write to.
-        value: "s3://easido-prod-user-scratch/EDIT-ME-aws-userid/biodiv/maps/chile_30m_2000_2026"
+        value: "s3://easido-prod-user-scratch/AROAT2ES654NDYC5GLXAR:jlopatin/biodiv/maps/chile_30m_2000_2026"
       - name: years
         value: "2000-2026"
       - name: tag
