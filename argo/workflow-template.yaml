@@ -1,203 +1,202 @@
-# Argo WorkflowTemplate for parallelizing scripts/73_map_inference.py across
-# the remaining tiles.
+# biodiv-map-inference — fan out scripts/73_map_inference.py over tiles
+# still missing from S3.
+#
+#   argo submit -n <ns> --from workflowtemplate/biodiv-map-inference \
+#     -p limit-tiles=3 -p num-chunks=3
+#
+# DAG: list-missing (S3 vs. tile list) -> split into per-pod chunks ->
+# process-chunk (fan-out, one pod per chunk). Steps hand off through Argo
+# artifacts (S3-backed), not a shared volume, so any pod can retry alone.
 #
 # MUST run inside the EASI Kubernetes cluster: the pipeline calls
-# datacube.Datacube() against the Data Cube Chile ODC index, which is only
-# reachable from inside EASI (DB_HOSTNAME/PORT/DATABASE/USERNAME/PASSWORD).
-# There is no public STAC fallback wired into this code path — see the repo
-# README. Everywhere marked EDIT-ME needs a value from you or the EASI
-# admins before this can run.
+# datacube.Datacube() against the Data Cube Chile ODC index, which only
+# answers from inside EASI. There is no public STAC fallback in this code
+# path — see the repo README.
 #
-# Not included in the public code repo, and not handled by this manifest:
-#   - Model artifacts: results/models_unified_topofix/.../model_seed{0..4}.pt
-#     (764 kB) and .../oof_predictions.csv (3.2 MB) — small, not flagged as
-#     sensitive, but must be baked into the image (private layer) or mounted
-#     from a volume. Same for the tiles CSV and the three *_unified_padded
-#     parquet files under data/derived/ — check those for coordinates before
-#     they go anywhere the image build can see them.
-#   - AWS and datacube-index credentials — pulled from k8s Secrets below,
-#     never inlined here.
+# Modeled on a working EASI WorkflowTemplate (lemu-national.yaml) rather
+# than guessed from scratch:
+#   - Pods pull this repo via git-sync onto PYTHONPATH instead of a custom
+#     image baking in code. list-missing/split-tiles are dask/vector-only
+#     and don't touch the datacube; process-chunk does, so only it mounts
+#     the db-config secret.
+#   - git-sync points at the PRIVATE Biodiversity_Chile repo (not the
+#     public Biodiversity_argo-process mirror), because that's the only
+#     copy that also has the model checkpoints and derived parquet files
+#     process-chunk needs (results/models_unified_topofix/...,
+#     data/derived/*_unified_padded.parquet) — see the repo README for
+#     which of those are and aren't safe to hand to a public repo. Pulling
+#     the private repo into a pod isn't new exposure: it's the same data
+#     Javier's own jupyterhub pod already has, same cluster, same user.
+#   - No AWS secret is wired in below — the lemu example doesn't use one
+#     either despite writing to S3, which points at IRSA (the pod's
+#     serviceAccountName carrying an IAM role) rather than a static
+#     credential Secret. EDIT-ME: confirm this with EASI admins; if
+#     Javier's service account isn't wired for IRSA, list-missing and
+#     process-chunk both need an explicit secretRef added back.
+#   - base-image below is the same shared EASI image lemu uses (datacube,
+#     dask, geopandas). EDIT-ME: our process-chunk additionally needs
+#     torch + rasterio (models_conv.py, maptask.py) — confirm those are
+#     already in that image, or this needs its own image built FROM it, or
+#     an installer initContainer. Don't assume; check before the test run.
 #
-# Parallelism model: each pod runs the SAME script as the existing pod's
-# workers (chile_gw / chile_pod halves), just on a smaller tile-file slice
-# and with the script's own internal parallelism turned off (--workers 0
-# --jobs 1) so the concurrency comes entirely from the number of pods, not
-# from also fighting the DB index and S3 with threads inside each pod.
+# Test run defaults: 3 tiles, 1 per pod, parallelism 3. Once verified,
+# raise limit-tiles/num-chunks together and bump parallelism — with EASI
+# admins, since this shares the ODC index and node pool with the
+# jupyterhub pod's chile_gw/chile_pod load.
 #
-# Dedup / "don't repeat finished tiles": there's no separate progress
-# tracker to keep in sync. argo/tile_progress.py lists what's actually in
-# S3 and treats a tile as done only once all its years are there — that's
-# what list-missing-tiles calls, and it's the same script you can run by
-# hand (from a machine with the AWS creds and boto3) for a live count
-# whenever you want one, independent of this workflow or the pod's own
+# Dedup / "don't repeat finished tiles": no separate progress tracker to
+# keep in sync. list-missing runs argo/tile_progress.py, which lists what's
+# actually in S3 and only treats a tile as done once every requested year
+# exists there. That's the same script you can run by hand for a live
+# progress check, independent of this workflow or the pod's own
 # STATUS.json:
 #
-#   python argo/tile_progress.py --tiles-csv tiles_native_10km_run.csv \
+#   python argo/tile_progress.py --tiles-csv results/figures/tiles_native_10km_run.csv \
 #     --s3-dest s3://easido-prod-user-scratch/<userid>/biodiv/maps/chile_30m_2000_2026 \
 #     --years 2000-2026
-#
-# The image needs boto3 and the aws cli (fetch-tiles-csv shells out to
-# `aws s3 cp`) in addition to the pipeline's own dependencies.
 
 apiVersion: argoproj.io/v1alpha1
 kind: WorkflowTemplate
 metadata:
   name: biodiv-map-inference
-  namespace: EDIT-ME-easi-namespace
+  labels:
+    name: biodiv-map-inference
+    owner: "jlopatin"          # EDIT-ME if EASI expects a different value
+    team: "EDIT-ME"
 spec:
   entrypoint: main
-
-  # Test run: 3 tiles, 1 per pod, 3 pods max. Once this is verified, raise
-  # limit-tiles and num-chunks together (still 1 tile/pod is simplest) and
-  # bump parallelism — with EASI admins, since it shares the ODC index and
-  # node pool with the jupyterhub pod's chile_gw/chile_pod load.
-  parallelism: 3
+  serviceAccountName: EDIT-ME   # e.g. data-pipelines-default — ask EASI admins
+  parallelism: 3                 # test run: 3 pods max. Raise once verified.
+  podGC:
+    strategy: OnWorkflowSuccess
+  artifactGC:
+    strategy: OnWorkflowDeletion
+    serviceAccountName: EDIT-ME  # same as above, usually
 
   arguments:
     parameters:
-      - name: image
-        # EDIT-ME: built from github.com/JavierLopatin/Biodiversity_argo-process
-        # plus the private layer with model artifacts/derived data (see above).
-        value: "EDIT-ME-registry/biodiv-map-inference:latest"
+      - name: base-image
+        # Same shared EASI image lemu-national uses. EDIT-ME: confirm it has
+        # torch + rasterio for process-chunk, or point this at your own image.
+        value: "444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base:develop.latest"
+      - name: repo-url
+        value: "https://github.com/JavierLopatin/Biodiversity_Chile.git"   # private
+      - name: repo-branch
+        value: main   # EDIT-ME if the working branch differs
+      - name: git-secret
+        value: EDIT-ME-biodiversity-chile-git-ro-access
+      - name: git-image
+        value: "registry.k8s.io/git-sync/git-sync:v4.5.0"
+      - name: db-config-secret
+        # Secret with key `.datacube.conf`, same pattern as lemu's
+        # easi-odc-v2-user-db — ask EASI admins for Javier's equivalent.
+        value: EDIT-ME-odc-user-db
       - name: s3-dest
-        # Same destination the pod's own workers already write to.
+        # Same destination the pod's own chile_gw/chile_pod workers write to.
         value: "s3://easido-prod-user-scratch/EDIT-ME-aws-userid/biodiv/maps/chile_30m_2000_2026"
-      - name: tiles-csv-s3
-        # results/figures/tiles_native_10km_run.csv (tile_id,xmin,ymin,xmax,ymax,
-        # UTM 19S), uploaded once to S3 so pods don't need pod-local storage.
-        value: "s3://easido-prod-user-scratch/EDIT-ME-aws-userid/biodiv/maps/config/tiles_native_10km_run.csv"
       - name: years
         value: "2000-2026"
       - name: tag
         value: "argo-test1"
       - name: limit-tiles
-        # Test run: only take the first 3 tiles that are actually missing
-        # (per tile_progress.py against S3 — never a hardcoded/guessed list).
-        # Set to "0" for the full remaining backlog once the test is good.
+        # Test run: only take the first 3 tiles tile_progress.py finds
+        # actually missing in S3. "0" = full remaining backlog.
         value: "3"
       - name: num-chunks
-        # 1 tile per pod for the test, so 3 tiles -> 3 pods running in
-        # parallel. For a full run, raising this past 1 tile/pod just means
-        # each pod works through its slice serially — usually not worth it;
-        # scale by raising limit-tiles/num-chunks together and parallelism.
+        # 1 tile per pod for the test (3 tiles -> 3 pods). Scale by raising
+        # limit-tiles/num-chunks together with parallelism, not by putting
+        # more than one tile per pod.
         value: "3"
 
+  volumes:
+    - name: work
+      emptyDir:
+        sizeLimit: 20Gi
+
   templates:
-    # ---- DAG: fetch tile list -> list what's missing -> split into chunks -> one pod per chunk
+    # ----------------------------------------------------------------- #
     - name: main
       dag:
         tasks:
-          - name: fetch-tiles-csv
-            template: fetch-tiles-csv
-
-          - name: list-missing-tiles
-            template: list-missing-tiles
-            dependencies: [fetch-tiles-csv]
-            arguments:
-              artifacts:
-                - name: tiles-csv
-                  from: "{{tasks.fetch-tiles-csv.outputs.artifacts.tiles-csv}}"
+          - name: list-missing
+            template: list-missing
 
           - name: split-tiles
             template: split-tiles
-            dependencies: [list-missing-tiles]
+            depends: "list-missing"
             arguments:
               artifacts:
-                - name: missing-csv
-                  from: "{{tasks.list-missing-tiles.outputs.artifacts.missing-csv}}"
+                - {name: missing-csv, from: "{{tasks.list-missing.outputs.artifacts.missing-csv}}"}
 
           - name: process-chunk
             template: process-chunk
-            dependencies: [split-tiles]
-            withParam: "{{tasks.split-tiles.outputs.result}}"   # JSON list of chunk ids, e.g. ["0","1",...]
+            depends: "split-tiles"
+            withParam: "{{tasks.split-tiles.outputs.parameters.chunk-ids}}"
             arguments:
               parameters:
-                - name: chunk-id
-                  value: "{{item}}"
+                - {name: chunk-id, value: "{{item}}"}
               artifacts:
-                - name: chunk-csv
-                  from: "{{tasks.split-tiles.outputs.artifacts.chunks}}/chunk_{{item}}.csv"
+                - {name: chunk-csv, from: "{{tasks.split-tiles.outputs.artifacts.chunks}}/chunk_{{item}}.csv"}
 
-    # ---- Step 0: pull tiles-csv-s3 down to a pod-local file so
-    # tile_progress.py (and split-tiles after it) can read it as a plain path.
-    - name: fetch-tiles-csv
-      inputs:
-        parameters:
-          - name: tiles-csv-s3
-            value: "{{workflow.parameters.tiles-csv-s3}}"
-      outputs:
-        artifacts:
-          - name: tiles-csv
-            path: /work/tiles.csv
+    # ----------------------------------------------------------------- #
+    # Vector/S3-only: no datacube access, so no db-config mount.
+    # Lists S3 under s3-dest, compares against the tiles CSV that comes
+    # with the git-synced repo, writes the tiles still missing a year.
+    - name: list-missing
+      retryStrategy: {limit: 2, retryPolicy: OnError}
+      volumes:
+        - &git-data-vol {name: git-data, emptyDir: {}}
+        - &git-secret-vol
+          name: git-secret
+          secret:
+            secretName: "{{workflow.parameters.git-secret}}"
+      initContainers: &git-sync-init
+        - name: git-sync
+          image: "{{workflow.parameters.git-image}}"
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c]
+          args:
+            - |
+              exec /git-sync \
+                --repo="{{workflow.parameters.repo-url}}" \
+                --ref="{{workflow.parameters.repo-branch}}" \
+                --root=/git --link=repo --one-time --depth=1
+          volumeMounts:
+            - {name: git-data, mountPath: /git}
+            - {name: git-secret, mountPath: /secret/git, readOnly: true}
+          # EDIT-ME: lemu authenticates git-sync via a GitHub App
+          # (GITSYNC_GITHUB_APP_*, see lemu-national.yaml). A plain
+          # read-only deploy key is simpler if that's what git-secret holds
+          # instead — set GITSYNC_USERNAME/GITSYNC_PASSWORD_FILE or
+          # GITSYNC_SSH env vars to match whatever's actually in the secret.
       container:
-        image: "{{workflow.parameters.image}}"
-        command: [aws, s3, cp, "{{inputs.parameters.tiles-csv-s3}}", /work/tiles.csv]
-        envFrom:
-          - secretRef:
-              name: EDIT-ME-aws-credentials-secret   # read-only S3 access
-
-    # ---- Step 1: full tile list minus what's already complete in S3, via
-    # argo/tile_progress.py (shipped in the image) — the same script anyone
-    # can run ad hoc for a live "what's done" check, so the Argo run and a
-    # human checking progress never disagree about what's finished.
-    # A tile counts as done only when every requested year's GeoTIFF
-    # (<tile_id>_<year>.tif) exists under s3-dest.
-    - name: list-missing-tiles
-      inputs:
-        parameters:
-          - name: s3-dest
-            value: "{{workflow.parameters.s3-dest}}"
-          - name: years
-            value: "{{workflow.parameters.years}}"
-          - name: limit-tiles
-            value: "{{workflow.parameters.limit-tiles}}"
-        artifacts:
-          - name: tiles-csv
-            path: /work/tiles.csv
+        image: "{{workflow.parameters.base-image}}"
+        command: [bash, -c]
+        args:
+          - |
+            python /git/repo/argo/tile_progress.py \
+              --tiles-csv /git/repo/results/figures/tiles_native_10km_run.csv \
+              --s3-dest "{{workflow.parameters.s3-dest}}" \
+              --years "{{workflow.parameters.years}}" \
+              --limit "{{workflow.parameters.limit-tiles}}" \
+              --out /work/missing_tiles.csv
+        env:
+          - &env-pythonpath {name: PYTHONPATH, value: /git/repo}
+        volumeMounts:
+          - &mount-work {name: work, mountPath: /work}
+          - &mount-git-data {name: git-data, mountPath: /git}
+        resources: {requests: {cpu: "1750m", memory: 3.5Gi}, limits: {cpu: "1750m", memory: 3.5Gi}}
       outputs:
-        artifacts:
-          - name: missing-csv
-            path: /work/missing_tiles.csv
-      container:
-        image: "{{workflow.parameters.image}}"
-        workingDir: /app   # EDIT-ME: wherever the image places the repo
-        command:
-          - python
-          - argo/tile_progress.py
-          - --tiles-csv
-          - /work/tiles.csv
-          - --s3-dest
-          - "{{inputs.parameters.s3-dest}}"
-          - --years
-          - "{{inputs.parameters.years}}"
-          - --limit
-          - "{{inputs.parameters.limit-tiles}}"
-          - --out
-          - /work/missing_tiles.csv
-        envFrom:
-          - secretRef:
-              name: EDIT-ME-aws-credentials-secret   # read-only S3 access
+        artifacts: [{name: missing-csv, path: /work/missing_tiles.csv}]
 
-    # ---- Step 2: split missing_tiles.csv into N roughly-equal chunk files,
-    # one per pod. Emits the chunk ids as JSON on stdout for withParam above.
+    # ----------------------------------------------------------------- #
+    # Splits missing_tiles.csv into num-chunks roughly-equal chunk files,
+    # one per pod. No datacube access.
     - name: split-tiles
       inputs:
-        artifacts:
-          - name: missing-csv
-            path: /work/missing_tiles.csv
-        parameters:
-          - name: num-chunks
-            value: "{{workflow.parameters.num-chunks}}"
-      outputs:
-        artifacts:
-          - name: chunks
-            path: /work/chunks
-        parameters:
-          - name: chunk-ids
-            valueFrom:
-              path: /work/chunk_ids.json
+        artifacts: [{name: missing-csv, path: /work/missing_tiles.csv}]
       container:
-        image: "{{workflow.parameters.image}}"
+        image: "{{workflow.parameters.base-image}}"
         command: [python, -c]
         args:
           - |
@@ -207,10 +206,10 @@ spec:
             header, rows = rows[0], rows[1:]
             n = int(os.environ["NUM_CHUNKS"])
             os.makedirs("/work/chunks", exist_ok=True)
-            size = math.ceil(len(rows) / n)
+            size = math.ceil(len(rows) / n) if rows else 0
             ids = []
             for i in range(n):
-                part = rows[i * size:(i + 1) * size]
+                part = rows[i * size:(i + 1) * size] if size else []
                 if not part:
                     continue
                 ids.append(str(i))
@@ -219,22 +218,40 @@ spec:
                     w.writerow(header)
                     w.writerows(part)
             json.dump(ids, open("/work/chunk_ids.json", "w"))
-        env:
-          - name: NUM_CHUNKS
-            value: "{{inputs.parameters.num-chunks}}"
+        env: [{name: NUM_CHUNKS, value: "{{workflow.parameters.num-chunks}}"}]
+        volumeMounts: [*mount-work]
+        resources: {requests: {cpu: "500m", memory: 512Mi}, limits: {cpu: "500m", memory: 512Mi}}
+      outputs:
+        artifacts: [{name: chunks, path: /work/chunks}]
+        parameters:
+          - {name: chunk-ids, valueFrom: {path: /work/chunk_ids.json}}
 
-    # ---- Step 3: one pod per chunk, running the same entry point the pod's
-    # own workers use, with --resume so a rerun skips tiles finished meanwhile.
+    # ----------------------------------------------------------------- #
+    # One pod per chunk: same entry point the pod's own chile_gw/chile_pod
+    # workers use, --resume so a rerun skips tiles finished meanwhile.
+    # This is the only template touching the datacube, so it's the only
+    # one mounting db-config.
     - name: process-chunk
       inputs:
-        parameters:
-          - name: chunk-id
-        artifacts:
-          - name: chunk-csv
-            path: /work/chunk.csv
+        parameters: [{name: chunk-id}]
+        artifacts: [{name: chunk-csv, path: /work/chunk.csv}]
+      retryStrategy: {limit: 2, retryPolicy: OnError}
+      activeDeadlineSeconds: EDIT-ME   # unknown until the 3-tile test measures one; lemu used ~2400s for a comparable single-cell datacube step
+      metadata:
+        annotations:
+          karpenter.sh/do-not-disrupt: "true"   # don't evict mid-tile
+      volumes:
+        - *git-data-vol
+        - *git-secret-vol
+        - &db-config-vol
+          name: db-config
+          secret:
+            secretName: "{{workflow.parameters.db-config-secret}}"
+            items: [{key: .datacube.conf, path: .datacube.conf}]
+      initContainers: *git-sync-init
       container:
-        image: "{{workflow.parameters.image}}"
-        workingDir: /app   # EDIT-ME: wherever the image places the repo
+        image: "{{workflow.parameters.base-image}}"
+        workingDir: /git/repo
         command: [python, scripts/73_map_inference.py]
         args:
           - --tiles-file
@@ -253,28 +270,24 @@ spec:
           - --tag
           - "{{workflow.parameters.tag}}-{{inputs.parameters.chunk-id}}"
         env:
-          - name: BIODIV_UNIFIED
-            value: "1"
-          - name: BIODIV_CURVES
-            value: "_raw100"
-        envFrom:
-          # DB_HOSTNAME, DB_PORT, DB_DATABASE, DB_USERNAME, DB_PASSWORD —
-          # same secret EASI already injects into jupyterhub workers.
-          - secretRef:
-              name: EDIT-ME-datacube-index-credentials
-          - secretRef:
-              name: EDIT-ME-aws-credentials-secret
+          - *env-pythonpath
+          - {name: ODC_CONFIG_PATH, value: /secret/dc/.datacube.conf}
+          - {name: DATACUBE_CONFIG_PATH, value: /secret/dc/.datacube.conf}
+          - {name: BIODIV_UNIFIED, value: "1"}
+          - {name: BIODIV_CURVES, value: "_raw100"}
+        volumeMounts:
+          - *mount-work
+          - *mount-git-data
+          - {name: db-config, mountPath: /secret/dc}
+        # EDIT-ME: sizing guess only, from lemu's comparable single-cell
+        # datacube step (cpu 7 / 28Gi) — --jobs 1 --workers 0 here means
+        # single-threaded, so this is probably high; tighten after the
+        # 3-tile test shows real usage.
         resources:
-          requests:
-            cpu: "EDIT-ME"      # e.g. "2" — one tile-year at a time, --jobs 1
-            memory: "EDIT-ME"   # e.g. "8Gi"
-          limits:
-            cpu: "EDIT-ME"
-            memory: "EDIT-ME"
+          requests: {cpu: "4", memory: 16Gi}
+          limits: {cpu: "4", memory: 16Gi}
         # EDIT-ME: pin to whatever node pool/toleration EASI uses for batch
-        # workloads, so this doesn't land on the same node as the jupyterhub
-        # pod and steal its 36 cores.
+        # workloads, so this doesn't land on the same node as the
+        # jupyterhub pod and steal its 36 cores.
         nodeSelector:
           EDIT-ME-node-pool-label: "EDIT-ME"
-      retryStrategy:
-        limit: "2"   # a tile that fails twice needs a human, not a third guess
