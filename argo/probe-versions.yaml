@@ -1,0 +1,61 @@
+# What library versions does the base image actually ship?
+#
+# The checkpoints are loaded with torch.load(weights_only=False), which
+# unpickles real Python objects: ck["ctx_preprocessor"] and, more delicately,
+# ck["target_scaler"] -- a fitted sklearn scaler whose .transform() is called
+# on every prediction (mapinfer.py:379-380) and again in the smearing inverse.
+# Unpickling a fitted estimator under a different sklearn version is the one
+# mismatch here that can change numbers rather than fail loudly.
+#
+# The training environment is pinned in Biodiversity_Chile/requirements.txt:
+#   numpy 2.3.5, pandas 3.0.3, scipy 1.17.1, scikit-learn 1.8.0,
+#   pyarrow 23.0.1, torch 2.12.0, xarray 2026.4.0
+#
+#   argo submit -n easi-workflows-argo argo/probe-versions.yaml
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: biodiv-probe-versions-
+  namespace: easi-workflows-argo
+spec:
+  serviceAccountName: easi-workflows-team-sa-argo
+  entrypoint: probe
+  templates:
+    - name: probe
+      script:
+        image: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
+        command: [python]
+        resources: {requests: {cpu: "500m", memory: 2Gi}, limits: {cpu: "500m", memory: 2Gi}}
+        source: |
+          import importlib, platform, sys
+
+          PINNED = {                    # Biodiversity_Chile/requirements.txt
+              "numpy": "2.3.5", "pandas": "3.0.3", "scipy": "1.17.1",
+              "sklearn": "1.8.0", "pyarrow": "23.0.1", "torch": "2.12.0",
+              "xarray": "2026.4.0",
+          }
+          EXTRA = ["joblib", "rasterio", "datacube", "odc.geo", "boto3", "dask", "distributed"]
+
+          print("python  ", sys.version.split()[0], "|", platform.platform())
+          print(f"\n{'module':<12} {'image':<14} {'trained with':<14} match")
+          for name in list(PINNED) + EXTRA:
+              try:
+                  v = importlib.import_module(name).__version__
+              except Exception as e:
+                  v = f"MISSING ({type(e).__name__})"
+              want = PINNED.get(name, "")
+              flag = "" if not want else ("ok" if v == want else "DIFFERS")
+              print(f"{name:<12} {v:<14} {want:<14} {flag}")
+
+          # sklearn is the one that can change results silently rather than
+          # crash, so name the exact estimator the checkpoints carry.
+          print("\nsklearn unpickle check:")
+          try:
+              import sklearn, warnings
+              from sklearn.exceptions import InconsistentVersionWarning
+              print("  sklearn", sklearn.__version__,
+                    "- InconsistentVersionWarning is raised on a version mismatch;")
+              print("  a real check needs a checkpoint, see the note below.")
+          except Exception as e:
+              print("  sklearn not importable:", e)

@@ -294,6 +294,15 @@ def run_tile_remote(tile: dict, payload: Payload, cfg: TileConfig,
     """
     try:
         st = worker_state(payload, cfg)
+        # worker_state is cached for the life of the worker, so its own
+        # configure_s3_access ran once, on the first tile. GDAL holds the credential
+        # values it was given and cannot renew them from the service-account token the
+        # way boto3 does, so a worker outliving the role session starts failing every
+        # read with RasterioIOError('The provided token has expired'). Refreshing per
+        # tile is what keeps a long-lived worker usable; it only reaches STS when the
+        # cached credentials are near expiry.
+        from datacube.utils.aws import configure_s3_access
+        configure_s3_access(aws_unsigned=False, requester_pays=True)
         return run_tile(st["dc"], tile, cfg, st["ens"], payload.resid, payload.y_train,
                         st["perm"], frozenset(skip_years))
     except Exception as e:                                          # noqa: BLE001

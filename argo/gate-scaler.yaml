@@ -1,0 +1,61 @@
+# Gate 1 of the private repo's scripts/74, run in the image that produces the maps.
+#
+# The checkpoints carry a pickled scikit-learn PowerTransformer that is called on every
+# prediction. docs/21 section 7 records that those pickles were written by scikit-learn
+# 1.3.1 and are read back under 1.8.0, and names this round trip as the check that says
+# whether the mismatch matters. It was run on the pod. This image is a third environment.
+#
+# Cheap and worth doing before committing ~1,000 pod-hours: a torch that cannot load the
+# weights fails loudly; a scikit-learn that unpickles a transformer it half-understands
+# returns different numbers and the maps still look plausible.
+#
+#   argo submit -n easi-workflows-argo argo/gate-scaler.yaml
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: biodiv-gate-scaler-
+  namespace: easi-workflows-argo
+spec:
+  serviceAccountName: easi-workflows-team-sa-argo
+  entrypoint: gate
+  templates:
+    - name: gate
+      volumes:
+        - {name: git-data, emptyDir: {}}
+        - {name: work, emptyDir: {}}
+      initContainers:
+        - name: git-sync
+          image: registry.k8s.io/git-sync/git-sync:v4.5.0
+          imagePullPolicy: IfNotPresent
+          command: [/bin/sh, -c]
+          args:
+            - |
+              exec /git-sync \
+                --repo="https://github.com/JavierLopatin/Biodiversity_argo-process.git" \
+                --ref=main --root=/git --link=repo --one-time --depth=1
+          volumeMounts: [{name: git-data, mountPath: /git}]
+        - name: stage-assets
+          image: amazon/aws-cli:2.17.62
+          command: [sh, -c]
+          args:
+            - |
+              set -eux
+              A=s3://easido-prod-dc-data-projects/easi-workflows-team/biodiv/assets
+              mkdir -p /work/assets
+              aws s3 sync "$A/models"  /work/assets/models
+              aws s3 sync "$A/derived" /work/assets/derived
+          volumeMounts: [{name: work, mountPath: /work}]
+      container:
+        image: 444488357543.dkr.ecr.us-west-2.amazonaws.com/easi-workflows-base-torch-cpu:develop.latest
+        workingDir: /git/repo
+        command: [python, argo/check_scaler.py]
+        args: ["--ckpt-dir", "/work/assets/models/final", "--derived", "/work/assets/derived"]
+        env:
+          - {name: PYTHONPATH, value: /git/repo}
+        resources:
+          requests: {cpu: "2", memory: 8Gi}
+          limits:   {cpu: "2", memory: 8Gi}
+        volumeMounts:
+          - {name: work, mountPath: /work}
+          - {name: git-data, mountPath: /git}

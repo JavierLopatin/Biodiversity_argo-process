@@ -298,6 +298,16 @@ def main() -> None:
             skip = frozenset(y for y in years if (t.tile_id, y) in done)
             if len(skip) == len(years):
                 continue
+            # Refresh the S3 credentials before every tile. configure_s3_access resolves
+            # them once and pins the values into GDAL's config; boto3 knows how to renew
+            # them from the projected service-account token, GDAL does not, because it was
+            # handed literals. In a pod that is a hard wall at the role's session length:
+            # a run of 2026-09-08 died on all five chunks at the 63-minute mark with
+            # RasterioIOError('The provided token has expired') -- Landsat and MapBiomas
+            # alike, mid-tile. Re-resolving per tile costs nothing (it sets config, it does
+            # not call STS unless the cached credentials are near expiry) and makes the pod
+            # lifetime independent of the credential lifetime.
+            configure_s3_access(aws_unsigned=False, requester_pays=True, client=client)
             t0 = time.time()
             rows = mt.run_tile(dc, tile, cfg, ens, resid, y_train, perm, skip)
             _append(man_path, rows)

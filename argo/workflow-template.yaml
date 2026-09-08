@@ -107,7 +107,7 @@ spec:
   # they are split across); pods actually launched = min(num-chunks, tiles).
   # Raising this alone changes nothing. Not a workflow parameter, so it can
   # only be changed here + `argo template create`, unlike -p limit-tiles.
-  parallelism: 3
+  parallelism: 5
   podGC:
     strategy: OnWorkflowSuccess
   artifactGC:
