@@ -430,6 +430,16 @@ spec:
           - {name: DATACUBE_CONFIG_PATH, value: /secret/dc/.datacube.conf}
           - {name: BIODIV_UNIFIED, value: "1"}
           - {name: BIODIV_CURVES, value: "_raw100"}
+          # usgs-landsat is requester-pays. 73_map_inference.py already calls
+          # configure_s3_access(aws_unsigned=False, requester_pays=True) before
+          # building the Datacube, and with --jobs 1 --workers 0 that runs in
+          # this very process -- but it only registers a DEFAULT rio config,
+          # which datacube activates per thread and which does not override a
+          # rasterio.Env already active on that thread. GDAL reads its config
+          # options from the environment directly, so setting them here holds
+          # no matter which thread opens the scene.
+          - {name: AWS_REQUEST_PAYER, value: requester}
+          - {name: AWS_DEFAULT_REGION, value: us-west-2}
         volumeMounts:
           - *mount-work
           - *mount-git-data

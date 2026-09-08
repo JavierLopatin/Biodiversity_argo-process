@@ -1,0 +1,65 @@
+# Does the Argo service account's IAM role carry read access to the
+# requester-pays bucket usgs-landsat?
+#
+# The first process-chunk run reached the Datacube, resolved real Landsat
+# scene paths, and then died with
+#   rasterio.errors.RasterioIOError: AccessDenied: Access Denied
+#     s3://usgs-landsat/collection02/level-2/standard/etm/2005/.../SR_B4.TIF
+# even though scripts/73_map_inference.py calls
+#   configure_s3_access(aws_unsigned=False, requester_pays=True, client=client)
+# before constructing the Datacube, so requester-pays IS being requested.
+#
+# The same object reads fine, direct and unproxied, under the hub identity
+# (easido-prod-csirochile-easihub-client/jlopatin) with
+# `--request-payer requester` -> RequestCharged: requester. So the bucket
+# policy is not the obstacle and EASI's caching proxy is not required; the
+# question is only whether THIS role is allowed to be the payer.
+#
+# Section 1 is the answer. Section 2 is the control: without the flag the
+# bucket returns 403 for everyone, so a 403 there and a 200 in section 1
+# means the role is fine and the fault is elsewhere in the pod.
+#
+#   argo submit -n easi-workflows-argo argo/probe-landsat.yaml
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: biodiv-probe-landsat-
+  namespace: easi-workflows-argo
+spec:
+  serviceAccountName: easi-workflows-team-sa-argo
+  entrypoint: probe
+  templates:
+    - name: probe
+      script:
+        image: amazon/aws-cli:2.17.62
+        command: [sh]
+        resources: {requests: {cpu: "200m", memory: 256Mi}, limits: {cpu: "200m", memory: 256Mi}}
+        source: |
+          set +e
+          B=usgs-landsat
+          K=collection02/level-2/standard/etm/2005/232/095/LE07_L2SP_232095_20051219_20200914_02_T1/LE07_L2SP_232095_20051219_20200914_02_T1_SR_B4.TIF
+
+          echo "=== 0. who am I ==="
+          aws sts get-caller-identity; echo "exit=$?"
+
+          echo; echo "=== 0b. region / proxy env as the pod sees it ==="
+          echo "AWS_REGION=${AWS_REGION:-unset}"
+          echo "AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-unset}"
+          echo "AWS_ROLE_ARN=${AWS_ROLE_ARN:-unset}"
+          echo "AWS_HTTPS=${AWS_HTTPS:-unset}"
+          echo "GDAL_HTTP_PROXY=${GDAL_HTTP_PROXY:-unset}"
+
+          echo; echo "=== 1. THE QUESTION: read usgs-landsat as payer ==="
+          aws s3api head-object --bucket "$B" --key "$K" \
+            --request-payer requester --region us-west-2
+          echo "exit=$?"
+
+          echo; echo "=== 2. control: same read WITHOUT --request-payer (403 expected) ==="
+          aws s3api head-object --bucket "$B" --key "$K" --region us-west-2
+          echo "exit=$?"
+
+          echo; echo "=== 3. actually fetch 1 byte, not just metadata ==="
+          aws s3api get-object --bucket "$B" --key "$K" \
+            --request-payer requester --region us-west-2 --range bytes=0-0 /tmp/b
+          echo "exit=$?"
