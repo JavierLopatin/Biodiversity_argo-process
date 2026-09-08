@@ -1,0 +1,28 @@
+# Smoke test for the Argo service account's S3 access.
+#
+# Run this FIRST, before biodiv-map-inference, whenever anything about the
+# namespace / service account / bucket changes. It proves the pod can write
+# to the team prefix with NO AWS credential Secret mounted, i.e. that the
+# service account carries the IAM role (IRSA). Everything in
+# workflow-template.yaml depends on that being true.
+#
+#   argo submit -n easi-workflows-argo argo/test-s3-access.yaml
+#
+apiVersion: argoproj.io/v1alpha1
+kind: Workflow
+metadata:
+  generateName: easi-workflows-team-s3-test-
+  namespace: easi-workflows-argo
+spec:
+  serviceAccountName: easi-workflows-team-sa-argo
+  entrypoint: test-s3-access
+  templates:
+    - name: test-s3-access
+      script:
+        image: amazon/aws-cli:2.17.62
+        command: [sh]
+        source: |
+          set -eux
+          echo "hello from easi-workflows-team" > /tmp/test.txt
+          aws s3 cp /tmp/test.txt s3://easido-prod-dc-data-projects/easi-workflows-team/test.txt
+          aws s3 ls s3://easido-prod-dc-data-projects/easi-workflows-team/
