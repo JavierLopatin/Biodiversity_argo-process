@@ -440,6 +440,11 @@ spec:
           # no matter which thread opens the scene.
           - {name: AWS_REQUEST_PAYER, value: requester}
           - {name: AWS_DEFAULT_REGION, value: us-west-2}
+          # Scene paths come out of the ODC index already resolved, so GDAL
+          # never needs to list a directory to find them. Turning the probe
+          # off drops a round trip per band AND means the role needs only
+          # s3:GetObject on usgs-landsat, not s3:ListBucket.
+          - {name: GDAL_DISABLE_READDIR_ON_OPEN, value: EMPTY_DIR}
         volumeMounts:
           - *mount-work
           - *mount-git-data
